@@ -22,6 +22,7 @@ st.set_page_config(
 # ============================================================
 TARGET_COLUMNS = [
     "S.No",
+    "Reporting Date",
     "Ticket No",
     "Start Date",
     "End Date",
@@ -33,6 +34,7 @@ TARGET_COLUMNS = [
 ]
 
 DEDUP_COLUMNS = [
+    "Reporting Date",
     "Ticket No",
     "Start Date",
     "End Date",
@@ -51,7 +53,7 @@ TEXT_COLUMNS = [
     "Vendor Supervisor",
 ]
 
-DATE_COLUMNS = ["Start Date", "End Date"]
+DATE_COLUMNS = ["Reporting Date", "Start Date", "End Date"]
 
 
 # ============================================================
@@ -276,6 +278,12 @@ def standardize_dataframe(df):
             "serial no",
             "serial number",
             "sr no",
+        ],
+        "Reporting Date": [
+            "reporting date",
+            "report date",
+            "date of report",
+            "reporting dt",
         ],
         "Ticket No": [
             "ticket no",
@@ -516,6 +524,7 @@ def parse_whatsapp_text(text):
                 records.append(current)
             current = {
                 "S.No": pd.NA,
+                "Reporting Date": current_message_date,
                 "Ticket No": tm.group(1).upper(),
                 "Start Date": "",
                 "End Date": "",
@@ -606,9 +615,10 @@ def sort_report(df):
     result["Start Date"] = normalize_datetime_series(result["Start Date"])
     result["End Date"] = normalize_datetime_series(result["End Date"])
     result["_TicketSort"] = result["Ticket No"].apply(clean_text)
+    result["Reporting Date"] = normalize_datetime_series(result["Reporting Date"])
     result = result.sort_values(
-        by=["Start Date", "End Date", "_TicketSort"],
-        ascending=[True, True, True],
+        by=["Start Date", "End Date", "Reporting Date", "_TicketSort"],
+        ascending=[True, True, True, True],
         na_position="last",
         kind="stable",
     ).drop(columns=["_TicketSort"])
@@ -650,6 +660,24 @@ def filter_by_date_overlap(df, from_date, to_date):
     result = temp.loc[mask].drop(columns=["_FilterEnd"])
 
     return result.copy()
+
+
+def filter_by_reporting_date(df, from_date, to_date):
+    """Filter records by the date on which the report/message was submitted."""
+    if df.empty:
+        return df.copy()
+
+    start = pd.Timestamp(from_date)
+    end = pd.Timestamp(to_date)
+    temp = df.copy()
+    temp["Reporting Date"] = normalize_datetime_series(temp["Reporting Date"])
+
+    mask = (
+        temp["Reporting Date"].notna()
+        & (temp["Reporting Date"] >= start)
+        & (temp["Reporting Date"] <= end)
+    )
+    return temp.loc[mask].copy()
 
 
 def prepare_for_editor(df):
@@ -726,7 +754,7 @@ def safe_filename_date(d):
 # ============================================================
 # EXCEL EXPORT
 # ============================================================
-def create_excel_report(df, from_date, to_date):
+def create_excel_report(df, from_date, to_date, reporting_from_date, reporting_to_date):
     """
     Generate a formatted Excel workbook in memory.
     """
@@ -772,8 +800,10 @@ def create_excel_report(df, from_date, to_date):
         summary = pd.DataFrame(
             {
                 "Metric": [
-                    "Report From",
-                    "Report To",
+                    "Activity Period From",
+                    "Activity Period To",
+                    "Reporting Date From",
+                    "Reporting Date To",
                     "Total Tickets",
                     "Complete Records",
                     "Incomplete Records",
@@ -782,6 +812,8 @@ def create_excel_report(df, from_date, to_date):
                 "Value": [
                     pd.Timestamp(from_date).date(),
                     pd.Timestamp(to_date).date(),
+                    pd.Timestamp(reporting_from_date).date(),
+                    pd.Timestamp(reporting_to_date).date(),
                     len(export_df),
                     int(
                         (
@@ -821,10 +853,10 @@ def create_excel_report(df, from_date, to_date):
     # Insert title / report period.
     ws["A1"] = "Daily Site Manpower & Work Progress Summary"
     ws["A2"] = (
-        f"Report Period: "
-        f"{pd.Timestamp(from_date).strftime('%d-%b-%Y')} "
-        f"to "
-        f"{pd.Timestamp(to_date).strftime('%d-%b-%Y')}"
+        f"Activity Period: {pd.Timestamp(from_date).strftime('%d-%b-%Y')} "
+        f"to {pd.Timestamp(to_date).strftime('%d-%b-%Y')} | "
+        f"Reporting Date: {pd.Timestamp(reporting_from_date).strftime('%d-%b-%Y')} "
+        f"to {pd.Timestamp(reporting_to_date).strftime('%d-%b-%Y')}"
     )
 
     ws["A1"].font = Font(
@@ -876,25 +908,24 @@ def create_excel_report(df, from_date, to_date):
                 wrap_text=True,
             )
 
-    # Date formatting.
-    start_col = TARGET_COLUMNS.index("Start Date") + 1
-    end_col = TARGET_COLUMNS.index("End Date") + 1
-
-    for row in range(header_row + 1, ws.max_row + 1):
-        ws.cell(row, start_col).number_format = "DD-MM-YYYY"
-        ws.cell(row, end_col).number_format = "DD-MM-YYYY"
+    # Date formatting for all report date fields.
+    for date_col in DATE_COLUMNS:
+        col_idx = TARGET_COLUMNS.index(date_col) + 1
+        for row in range(header_row + 1, ws.max_row + 1):
+            ws.cell(row, col_idx).number_format = "DD-MM-YYYY"
 
     # Widths.
     widths = {
         "A": 8,
         "B": 16,
-        "C": 14,
+        "C": 16,
         "D": 14,
-        "E": 28,
-        "F": 42,
-        "G": 24,
+        "E": 14,
+        "F": 28,
+        "G": 42,
         "H": 24,
-        "I": 18,
+        "I": 24,
+        "J": 18,
     }
 
     for col_letter, width in widths.items():
@@ -987,39 +1018,65 @@ st.markdown(
 
 today = date.today()
 
-date_col1, date_col2 = st.columns(2)
+st.write("**Activity Period Filter**")
+activity_col1, activity_col2 = st.columns(2)
 
-with date_col1:
+with activity_col1:
     from_date = st.date_input(
-        "From Date",
+        "Activity From Date",
         value=today,
         format="DD/MM/YYYY",
         key="report_from_date",
     )
 
-with date_col2:
+with activity_col2:
     to_date = st.date_input(
-        "To Date",
+        "Activity To Date",
         value=today,
         format="DD/MM/YYYY",
         key="report_to_date",
     )
 
+reporting_col1, reporting_col2 = st.columns(2)
+
+with reporting_col1:
+    reporting_from_date = st.date_input(
+        "Reporting Date From",
+        value=from_date,
+        format="DD/MM/YYYY",
+        key="reporting_from_date",
+    )
+
+with reporting_col2:
+    reporting_to_date = st.date_input(
+        "Reporting Date To",
+        value=to_date,
+        format="DD/MM/YYYY",
+        key="reporting_to_date",
+    )
+
 st.markdown(
     '<div class="date-help">'
-    "Select the start and end dates separately. Records are included when "
-    "their activity period overlaps the selected report period."
+    "Activity dates filter by work-period overlap. Reporting Date filters by the date "
+    "on which the WhatsApp report was submitted. For WhatsApp records, this is taken "
+    "from the WhatsApp message date. Existing Excel records must contain a Reporting Date "
+    "column to participate in the reporting-date filter."
     "</div>",
     unsafe_allow_html=True,
 )
 
 if from_date > to_date:
-    st.error("❌ From Date cannot be later than To Date.")
+    st.error("❌ Activity From Date cannot be later than Activity To Date.")
+    st.stop()
+
+if reporting_from_date > reporting_to_date:
+    st.error("❌ Reporting Date From cannot be later than Reporting Date To.")
     st.stop()
 
 st.success(
-    f"Selected period: **{from_date.strftime('%d-%b-%Y')}** "
-    f"to **{to_date.strftime('%d-%b-%Y')}**"
+    f"Activity period: **{from_date.strftime('%d-%b-%Y')}** to **{to_date.strftime('%d-%b-%Y')}** | "
+    f"Reporting dates: **{reporting_from_date.strftime('%d-%b-%Y')}** to "
+    f"**{reporting_to_date.strftime('%d-%b-%Y')}**"
 )
 
 
@@ -1246,6 +1303,14 @@ if merge_button:
             to_date,
         )
 
+        before_reporting_filter = len(filtered)
+        filtered = filter_by_reporting_date(
+            filtered,
+            reporting_from_date,
+            reporting_to_date,
+        )
+        reporting_excluded = before_reporting_filter - len(filtered)
+
         filtered = prepare_for_editor(filtered)
         filtered = sort_report(filtered)
 
@@ -1255,7 +1320,8 @@ if merge_button:
         st.success(
             f"Merge completed. **{len(merged)} unique records** found. "
             f"**{duplicates_removed} exact duplicate(s)** removed. "
-            f"**{len(filtered)} record(s)** fall within/overlap the selected period."
+            f"**{len(filtered)} record(s)** match both the activity-period and reporting-date filters. "
+            f"**{reporting_excluded} record(s)** were excluded by reporting date."
         )
 
 
@@ -1288,6 +1354,11 @@ else:
                 "S.No",
                 disabled=True,
                 width="small",
+            ),
+            "Reporting Date": st.column_config.DateColumn(
+                "Reporting Date",
+                format="DD/MM/YYYY",
+                width="medium",
             ),
             "Ticket No": st.column_config.TextColumn(
                 "Ticket No",
@@ -1441,6 +1512,8 @@ if not st.session_state.filtered_df.empty:
         final_df,
         from_date,
         to_date,
+        reporting_from_date,
+        reporting_to_date,
     )
 
     filename = (
@@ -1472,7 +1545,7 @@ with st.sidebar:
         """
         **Workflow**
 
-        1. Select **From Date** and **To Date**.
+        1. Select the **Activity From/To Date** and **Reporting Date From/To** filters.
         2. Upload the existing Excel report.
         3. Upload WhatsApp TXT and/or paste WhatsApp messages.
         4. Click **Parse Pasted Messages** if you pasted text.
@@ -1483,7 +1556,10 @@ with st.sidebar:
 
         **Date filtering**
 
-        The app uses activity-period overlap.
+        The app applies two filters:
+
+        1. **Activity Period** — records are included when their activity interval overlaps the selected period.
+        2. **Reporting Date** — records are included when the WhatsApp message/report date falls within the selected reporting-date range.
 
         For example:
 
