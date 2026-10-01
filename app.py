@@ -384,6 +384,26 @@ def find_header_row(raw_df):
     return None
 
 
+def assign_excel_reporting_date(df, report_date):
+    """
+    Existing Excel records are always retained.
+    If an older Excel file has no Reporting Date, assign the date on which
+    this app is being used. Existing Reporting Date values are preserved.
+    """
+    result = df.copy()
+
+    if result.empty:
+        return result
+
+    report_ts = pd.Timestamp(report_date).normalize()
+    result["Reporting Date"] = normalize_datetime_series(
+        result["Reporting Date"]
+    )
+    result["Reporting Date"] = result["Reporting Date"].fillna(report_ts)
+
+    return result
+
+
 def read_excel_file(uploaded_file):
     """Read the first worksheet and detect its header row."""
     try:
@@ -853,9 +873,11 @@ def create_excel_report(df, from_date, to_date, reporting_from_date, reporting_t
     # Insert title / report period.
     ws["A1"] = "Daily Site Manpower & Work Progress Summary"
     ws["A2"] = (
+        f"Report Generated: {pd.Timestamp(date.today()).strftime('%d-%b-%Y')} | "
         f"Activity Period: {pd.Timestamp(from_date).strftime('%d-%b-%Y')} "
         f"to {pd.Timestamp(to_date).strftime('%d-%b-%Y')} | "
-        f"Reporting Date: {pd.Timestamp(reporting_from_date).strftime('%d-%b-%Y')} "
+        f"WhatsApp Reporting Date Filter: "
+        f"{pd.Timestamp(reporting_from_date).strftime('%d-%b-%Y')} "
         f"to {pd.Timestamp(reporting_to_date).strftime('%d-%b-%Y')}"
     )
 
@@ -1059,8 +1081,9 @@ st.markdown(
     '<div class="date-help">'
     "Activity dates filter by work-period overlap. Reporting Date filters by the date "
     "on which the WhatsApp report was submitted. For WhatsApp records, this is taken "
-    "from the WhatsApp message date. Existing Excel records must contain a Reporting Date "
-    "column to participate in the reporting-date filter."
+    "from the WhatsApp message date. Existing Excel records are always retained; "
+    "if an older Excel file has no Reporting Date, the app assigns the date on which "
+    "the app is being used."
     "</div>",
     unsafe_allow_html=True,
 )
@@ -1101,11 +1124,17 @@ if excel_file is not None:
         if excel_error:
             st.error(f"Excel reading error: {excel_error}")
         else:
+            # Existing Excel records are always retained.
+            # If Reporting Date is missing, use the date on which this app is used.
+            excel_df = assign_excel_reporting_date(excel_df, today)
+
             st.session_state.excel_df = excel_df
             st.session_state.last_excel_name = excel_file.name
             st.success(
                 f"Excel loaded successfully: "
-                f"**{len(excel_df)} records** found."
+                f"**{len(excel_df)} records** found. "
+                f"Missing Reporting Date values set to "
+                f"**{today.strftime('%d-%b-%Y')}**."
             )
 
 if not st.session_state.excel_df.empty:
@@ -1262,66 +1291,94 @@ if merge_button:
     whatsapp_txt_df = st.session_state.whatsapp_txt_df.copy()
     whatsapp_pasted_df = st.session_state.whatsapp_pasted_df.copy()
 
+    whatsapp_pieces = []
+
+    if not whatsapp_txt_df.empty:
+        whatsapp_pieces.append(whatsapp_txt_df)
+
+    if not whatsapp_pasted_df.empty:
+        whatsapp_pieces.append(whatsapp_pasted_df)
+
+    # Existing Excel is the base report and is ALWAYS retained.
+    if not excel_df.empty:
+        excel_df = assign_excel_reporting_date(excel_df, today)
+        excel_df = standardize_dataframe(excel_df)
+        excel_df["Ticket No"] = excel_df["Ticket No"].apply(clean_text)
+        excel_df = excel_df[excel_df["Ticket No"] != ""].copy()
+
+    # WhatsApp records are the only records affected by the date filters.
+    if whatsapp_pieces:
+        whatsapp_df = pd.concat(whatsapp_pieces, ignore_index=True)
+        whatsapp_df = standardize_dataframe(whatsapp_df)
+        whatsapp_df["Ticket No"] = whatsapp_df["Ticket No"].apply(clean_text)
+        whatsapp_df = whatsapp_df[whatsapp_df["Ticket No"] != ""].copy()
+    else:
+        whatsapp_df = pd.DataFrame(columns=TARGET_COLUMNS)
+
+    whatsapp_before_filter = len(whatsapp_df)
+
+    whatsapp_filtered = filter_by_date_overlap(
+        whatsapp_df,
+        from_date,
+        to_date,
+    )
+
+    whatsapp_after_activity = len(whatsapp_filtered)
+    activity_excluded = whatsapp_before_filter - whatsapp_after_activity
+
+    whatsapp_before_reporting = len(whatsapp_filtered)
+
+    whatsapp_filtered = filter_by_reporting_date(
+        whatsapp_filtered,
+        reporting_from_date,
+        reporting_to_date,
+    )
+
+    reporting_excluded = whatsapp_before_reporting - len(whatsapp_filtered)
+
     pieces = []
 
     if not excel_df.empty:
         pieces.append(excel_df)
 
-    if not whatsapp_txt_df.empty:
-        pieces.append(whatsapp_txt_df)
-
-    if not whatsapp_pasted_df.empty:
-        pieces.append(whatsapp_pasted_df)
+    if not whatsapp_filtered.empty:
+        pieces.append(whatsapp_filtered)
 
     if not pieces:
         st.error(
             "Please upload an Excel report and/or add WhatsApp data first."
         )
     else:
-        merged = pd.concat(
-            pieces,
-            ignore_index=True,
-        )
-
+        # Excel is concatenated first so an exact Excel/WhatsApp duplicate
+        # keeps the existing Excel version.
+        merged = pd.concat(pieces, ignore_index=True)
         merged = standardize_dataframe(merged)
 
-        # Remove empty ticket rows.
         merged["Ticket No"] = merged["Ticket No"].apply(clean_text)
-        merged = merged[
-            merged["Ticket No"] != ""
-        ].copy()
+        merged = merged[merged["Ticket No"] != ""].copy()
 
         before_dedup = len(merged)
-
         merged = remove_exact_duplicates(merged)
-
         duplicates_removed = before_dedup - len(merged)
 
-        filtered = filter_by_date_overlap(
-            merged,
-            from_date,
-            to_date,
-        )
-
-        before_reporting_filter = len(filtered)
-        filtered = filter_by_reporting_date(
-            filtered,
-            reporting_from_date,
-            reporting_to_date,
-        )
-        reporting_excluded = before_reporting_filter - len(filtered)
-
-        filtered = prepare_for_editor(filtered)
+        filtered = prepare_for_editor(merged)
         filtered = sort_report(filtered)
 
         st.session_state.merged_df = merged
         st.session_state.filtered_df = filtered
 
         st.success(
-            f"Merge completed. **{len(merged)} unique records** found. "
-            f"**{duplicates_removed} exact duplicate(s)** removed. "
-            f"**{len(filtered)} record(s)** match both the activity-period and reporting-date filters. "
-            f"**{reporting_excluded} record(s)** were excluded by reporting date."
+            f"Merge completed. **{len(excel_df)} existing Excel record(s) retained**. "
+            f"**{whatsapp_before_filter} WhatsApp record(s)** supplied; "
+            f"**{activity_excluded}** excluded by Activity Period and "
+            f"**{reporting_excluded}** excluded by Reporting Date. "
+            f"**{len(merged)} final unique record(s)** remain after "
+            f"**{duplicates_removed} exact duplicate(s)** removal."
+        )
+
+        st.info(
+            f"Existing Excel records without a Reporting Date were assigned "
+            f"**{today.strftime('%d-%b-%Y')}**, the date this app is being used."
         )
 
 
@@ -1556,10 +1613,14 @@ with st.sidebar:
 
         **Date filtering**
 
-        The app applies two filters:
+        The app applies two filters to **WhatsApp records only**:
 
-        1. **Activity Period** — records are included when their activity interval overlaps the selected period.
-        2. **Reporting Date** — records are included when the WhatsApp message/report date falls within the selected reporting-date range.
+        1. **Activity Period** — WhatsApp records are included when their activity interval overlaps the selected period.
+        2. **Reporting Date** — WhatsApp records are included when their report/message date falls within the selected reporting-date range.
+
+        Existing Excel records are the base report and are **always retained**.
+        If an older Excel file has no Reporting Date, the app assigns today's date
+        (the date on which this app is being used).
 
         For example:
 
