@@ -405,44 +405,57 @@ def assign_excel_reporting_date(df, report_date):
 
 
 def read_excel_file(uploaded_file):
-    """Read the first worksheet and detect its header row."""
+    """Read and combine all worksheets in one uploaded Excel workbook."""
     try:
         file_bytes = uploaded_file.getvalue()
-
-        raw = pd.read_excel(
+        workbook_sheets = pd.read_excel(
             io.BytesIO(file_bytes),
-            sheet_name=0,
+            sheet_name=None,
             header=None,
         )
 
-        if raw.empty:
-            return pd.DataFrame(columns=TARGET_COLUMNS), "The Excel file is empty."
+        sheet_frames = []
+        skipped_sheets = []
 
-        header_row = find_header_row(raw)
+        for sheet_name, raw in workbook_sheets.items():
+            if raw.empty:
+                skipped_sheets.append(f"{sheet_name} (empty)")
+                continue
 
-        if header_row is None:
-            # Try assuming first row is the header.
-            df = pd.read_excel(
-                io.BytesIO(file_bytes),
-                sheet_name=0,
-                header=0,
+            header_row = find_header_row(raw)
+
+            if header_row is None:
+                df = pd.read_excel(
+                    io.BytesIO(file_bytes),
+                    sheet_name=sheet_name,
+                    header=0,
+                )
+            else:
+                df = pd.read_excel(
+                    io.BytesIO(file_bytes),
+                    sheet_name=sheet_name,
+                    header=header_row,
+                )
+
+            standardized = standardize_dataframe(df)
+            standardized["Ticket No"] = standardized["Ticket No"].apply(clean_text)
+            standardized = standardized[standardized["Ticket No"] != ""].copy()
+
+            if not standardized.empty:
+                # Keep source information for traceability in the UI/logging;
+                # it is not added as a final report column.
+                sheet_frames.append(standardized)
+            else:
+                skipped_sheets.append(f"{sheet_name} (no ticket records)")
+
+        if not sheet_frames:
+            return (
+                pd.DataFrame(columns=TARGET_COLUMNS),
+                "No worksheets with recognizable Ticket No. records were found."
             )
-        else:
-            df = pd.read_excel(
-                io.BytesIO(file_bytes),
-                sheet_name=0,
-                header=header_row,
-            )
 
-        standardized = standardize_dataframe(df)
-
-        # Remove rows without Ticket No.
-        standardized["Ticket No"] = standardized["Ticket No"].apply(clean_text)
-        standardized = standardized[
-            standardized["Ticket No"] != ""
-        ].copy()
-
-        return standardized, None
+        combined = pd.concat(sheet_frames, ignore_index=True)
+        return combined, None
 
     except Exception as exc:
         return pd.DataFrame(columns=TARGET_COLUMNS), str(exc)
@@ -1009,6 +1022,9 @@ if "filtered_df" not in st.session_state:
 if "last_excel_name" not in st.session_state:
     st.session_state.last_excel_name = ""
 
+if "last_excel_signature" not in st.session_state:
+    st.session_state.last_excel_signature = ()
+
 if "last_txt_name" not in st.session_state:
     st.session_state.last_txt_name = ""
 
@@ -1111,36 +1127,68 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-excel_file = st.file_uploader(
-    "Upload your existing report Excel",
+excel_files = st.file_uploader(
+    "Upload one or more existing report Excel files (all worksheets will be combined)",
     type=["xlsx", "xls", "xlsm"],
+    accept_multiple_files=True,
     key="excel_uploader",
 )
 
-if excel_file is not None:
-    if excel_file.name != st.session_state.last_excel_name:
-        excel_df, excel_error = read_excel_file(excel_file)
+# Build a stable signature so Streamlit reruns don't append the same files repeatedly.
+excel_signature = tuple(
+    (f.name, len(f.getvalue()))
+    for f in (excel_files or [])
+)
 
-        if excel_error:
-            st.error(f"Excel reading error: {excel_error}")
-        else:
-            # Existing Excel records are always retained.
-            # If Reporting Date is missing, use the date on which this app is used.
-            excel_df = assign_excel_reporting_date(excel_df, today)
+if excel_signature != st.session_state.last_excel_signature:
+    if excel_files:
+        excel_frames = []
+        excel_errors = []
+        loaded_sheet_count = 0
 
-            st.session_state.excel_df = excel_df
-            st.session_state.last_excel_name = excel_file.name
+        for excel_file in excel_files:
+            excel_df_part, excel_error = read_excel_file(excel_file)
+
+            if excel_error:
+                excel_errors.append(f"{excel_file.name}: {excel_error}")
+                continue
+
+            if not excel_df_part.empty:
+                excel_df_part = assign_excel_reporting_date(excel_df_part, today)
+                excel_frames.append(excel_df_part)
+                loaded_sheet_count += 1
+
+        if excel_errors:
+            for error in excel_errors:
+                st.error(f"Excel reading error — {error}")
+
+        if excel_frames:
+            combined_excel = pd.concat(excel_frames, ignore_index=True)
+            st.session_state.excel_df = combined_excel
+            st.session_state.last_excel_name = ", ".join(f.name for f in excel_files)
+            st.session_state.last_excel_signature = excel_signature
+
             st.success(
-                f"Excel loaded successfully: "
-                f"**{len(excel_df)} records** found. "
-                f"Missing Reporting Date values set to "
-                f"**{today.strftime('%d-%b-%Y')}**."
+                f"Loaded **{len(excel_files)} Excel file(s)** containing "
+                f"**{len(combined_excel)} record(s)**. "
+                f"Worksheets with records were combined. Missing Reporting Date "
+                f"values were set to **{today.strftime('%d-%b-%Y')}**."
             )
+        else:
+            st.session_state.excel_df = pd.DataFrame(columns=TARGET_COLUMNS)
+            st.session_state.last_excel_name = ""
+            st.session_state.last_excel_signature = excel_signature
+            if not excel_errors:
+                st.warning("No ticket records were found in the selected Excel files.")
+    else:
+        st.session_state.excel_df = pd.DataFrame(columns=TARGET_COLUMNS)
+        st.session_state.last_excel_name = ""
+        st.session_state.last_excel_signature = ()
 
 if not st.session_state.excel_df.empty:
     st.caption(
-        f"Current Excel records: "
-        f"{len(st.session_state.excel_df)}"
+        f"Current Excel records loaded from selected file(s): "
+        f"**{len(st.session_state.excel_df)}**"
     )
 
 
@@ -1676,5 +1724,6 @@ with st.sidebar:
             columns=TARGET_COLUMNS
         )
         st.session_state.last_excel_name = ""
+        st.session_state.last_excel_signature = ()
         st.session_state.last_txt_name = ""
         st.rerun()
